@@ -21,6 +21,7 @@ import {
   openEvmWindow,
   recoverKemKeypairFromSecret,
   registerKemKey,
+  repickEvmAccount,
   saveKemKeypair,
   sendSwap,
   toHex,
@@ -88,7 +89,9 @@ export function App() {
 
   const [evmWallet, setEvmWallet] = useState<WalletClient | null>(null);
   const [evmAddress, setEvmAddress] = useState<string | null>(null);
+  const [evmAccounts, setEvmAccounts] = useState<string[] | null>(null);
   const [evmStep, setEvmStep] = useState<Step>({ kind: "idle" });
+  const [repickStep, setRepickStep] = useState<Step>({ kind: "idle" });
   const [deployStep, setDeployStep] = useState<Step>({ kind: "idle" });
   const [deployed, setDeployed] = useState<DeployResult | null>(null);
   const [verifyStep, setVerifyStep] = useState<Step>({ kind: "idle" });
@@ -321,17 +324,92 @@ export function App() {
   async function onConnectEvm() {
     setEvmStep({ kind: "busy", note: "Asking QoreX to connect this site…" });
     try {
-      const { walletClient, address: evmAddr } = await connectEvmWallet();
+      const {
+        walletClient,
+        address: evmAddr,
+        accounts,
+      } = await connectEvmWallet();
       setEvmWallet(walletClient);
       setEvmAddress(evmAddr);
+      setEvmAccounts(accounts);
       setEvmStep({
         kind: "ok",
-        text: `EVM wallet connected — this is the MAIN wallet (${evmAddr}). The deploy button is now enabled.`,
+        text: `Connected — the main wallet (${evmAddr}) is in use. The deploy button is now enabled.`,
       });
     } catch (e) {
       setEvmWallet(null);
       setEvmAddress(null);
+      setEvmAccounts(null);
       setEvmStep({
+        kind: "err",
+        text: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  // Force QoreX to forget this site's EVM permission and ask again, so
+  // Toni can pick the main wallet in QoreX's account picker. Both calls'
+  // exact outcomes are shown below — a revoke QoreX does not support is
+  // reported, not hidden. If the picker returns the main wallet, the page
+  // connects it straight away and enables the deploy.
+  async function onRepickEvm() {
+    setEvmWallet(null);
+    setEvmAddress(null);
+    setEvmAccounts(null);
+    setDeployStep({ kind: "idle" });
+    setRepickStep({
+      kind: "busy",
+      note: "Revoking this site's EVM permission in QoreX, then asking it to pick an account… (watch for the QoreX picker — pick the MAIN wallet)",
+    });
+    try {
+      const res = await repickEvmAccount();
+      const revokeText = res.revoke.ok
+        ? `revoke: OK (${JSON.stringify(res.revoke.result ?? null)})`
+        : `revoke: FAILED — ${res.revoke.error ?? "unknown error"}`;
+      const requestText = res.request.ok
+        ? `request: OK — accounts now: ${(res.request.accounts ?? []).join(", ") || "(none)"}`
+        : `request: FAILED — ${res.request.error ?? "unknown error"}`;
+      const pickedMain = (res.request.accounts ?? []).some(
+        (a) => a.toLowerCase() === EXPECTED_EVM_ADDRESS.toLowerCase(),
+      );
+      if (pickedMain) {
+        try {
+          const {
+            walletClient,
+            address: evmAddr,
+            accounts,
+          } = await connectEvmWallet();
+          setEvmWallet(walletClient);
+          setEvmAddress(evmAddr);
+          setEvmAccounts(accounts);
+          setEvmStep({
+            kind: "ok",
+            text: `Connected — the main wallet (${evmAddr}) is in use. The deploy button is now enabled.`,
+          });
+          setRepickStep({
+            kind: "ok",
+            text: `${revokeText} | ${requestText} — main wallet picked, deploy is now enabled.`,
+          });
+        } catch (e) {
+          setRepickStep({
+            kind: "err",
+            text: `${revokeText} | ${requestText} — then connect failed: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          });
+        }
+        return;
+      }
+      setRepickStep({
+        kind: "err",
+        text:
+          `${revokeText} | ${requestText}` +
+          (res.revoke.ok
+            ? " — the main wallet still was not picked. Try the picker again, or disconnect this site in QoreX's connected-sites settings and reconnect."
+            : " — QoreX did not revoke the permission (see the error above). Disconnect this site in QoreX's connected-sites settings by hand, then click '1. Connect EVM wallet (QoreX)' again."),
+      });
+    } catch (e) {
+      setRepickStep({
         kind: "err",
         text: e instanceof Error ? e.message : String(e),
       });
@@ -636,9 +714,13 @@ export function App() {
         <p className="muted small">
           Why here and not Remix: QoreX exposes only "Account 16" (0 QOR) to
           Remix and cannot switch to the main wallet there. This page talks
-          to the QoreX EVM provider directly — QoreX asks you which account
-          to connect to this site, so pick the <b>main wallet</b>. The deploy
-          stays disabled until the main wallet (
+          to the QoreX EVM provider directly and <b>lists every account</b>{" "}
+          QoreX exposes to this site — if the main wallet is among them, the
+          page uses it even when QoreX lists it second. If only Account 16
+          shows up, use <b>"Re-pick EVM account"</b> below: it revokes this
+          site's permission in QoreX and forces its account picker, so you
+          can pick the <b>main wallet</b>. The deploy stays disabled until
+          the main wallet (
           <span className="mono">{EXPECTED_EVM_ADDRESS}</span>) is connected.
         </p>
 
@@ -648,6 +730,9 @@ export function App() {
         >
           1. Connect EVM wallet (QoreX)
         </button>
+        <button className="secondary" onClick={onRepickEvm}>
+          Re-pick EVM account
+        </button>
         {evmAddress ? (
           <p className="mono">
             {evmAddress}
@@ -656,7 +741,20 @@ export function App() {
               : " — ⚠️ NOT the main wallet"}
           </p>
         ) : null}
+        {evmAccounts ? (
+          <p className="mono small">
+            QoreX exposed {evmAccounts.length} account(s) to this site:{" "}
+            {evmAccounts
+              .map((a) =>
+                a.toLowerCase() === EXPECTED_EVM_ADDRESS.toLowerCase()
+                  ? `${a} ✅ main`
+                  : a,
+              )
+              .join(" · ")}
+          </p>
+        ) : null}
         <Status step={evmStep} />
+        <Status step={repickStep} />
 
         <button
           onClick={onDeploy}

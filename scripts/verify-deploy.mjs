@@ -37,7 +37,7 @@ const bundleFile = readdirSync(`${root}/docs/assets`).find((f) =>
 if (!bundleFile) throw new Error("No built index-*.js bundle found in docs/assets");
 const bundle = readFileSync(`${root}/docs/assets/${bundleFile}`, "utf8");
 console.log("bundle:", bundleFile, `(${(bundle.length / 1024).toFixed(0)} KB)`);
-for (const s of ["Deploy PqcKeyStatusChecker", "Connect EVM wallet (QoreX)", "Open EVM window (only if deploy fails)", "Verify on chain (lastRegistered / lastAlgorithmId)", "0x9ac294544131ac1709c3bbf8e680041475f04f61"]) {
+for (const s of ["Deploy PqcKeyStatusChecker", "Connect EVM wallet (QoreX)", "Re-pick EVM account", "wallet_revokePermissions", "eth_accounts", "Open EVM window (only if deploy fails)", "Verify on chain (lastRegistered / lastAlgorithmId)", "0x9ac294544131ac1709c3bbf8e680041475f04f61"]) {
   console.log(`bundle contains ${JSON.stringify(s)}:`, bundle.includes(s));
 }
 console.log("bundle contains bytecode fragment:", bundle.includes(bytecode.slice(0, 80)));

@@ -383,15 +383,22 @@ export function toHex(bytes: Uint8Array): string {
 //    still refuses it, the deploy fails here with QoreX's exact message and
 //    the Remix route (or a newer QoreX) is the fallback.
 //  - The EVM provider may expose a different account than the native lane
-//    (Remix saw only "Account 16"). connectEvmWallet() REFUSES unless the
-//    connected EVM account is the main wallet 0x9ac2… — never deploy from
-//    the wrong account.
+//    (Remix saw only "Account 16", and this page's first connect did too —
+//    QoreX silently reconnects Account 16 with no picker). connectEvmWallet()
+//    therefore ENUMERATES every account QoreX exposes (eth_requestAccounts
+//    + eth_accounts) and builds a wallet client bound to the MAIN wallet
+//    even when it is not accounts[0]; it still REFUSES unless the main
+//    wallet is among them. "Re-pick EVM account" calls EIP-2255
+//    wallet_revokePermissions + eth_requestAccounts to force QoreX's
+//    picker; if QoreX does not support the revoke, its exact error is
+//    shown and the fallback is disconnecting the site in QoreX's
+//    connected-sites settings by hand.
 
 import {
   createEvmClient,
   deployContract as evmDeployContract,
-  getEvmWalletClient,
   readContract as evmReadContract,
+  requestAccounts as evmRequestAccounts,
   type EvmClient,
 } from "@qorechain/evm";
 import {
@@ -399,6 +406,7 @@ import {
   findQorexEip1193,
   type QorexEip1193Provider,
 } from "@qorechain/qorex-types";
+import { createWalletClient, custom, defineChain } from "viem";
 import type { Address, Hash, WalletClient } from "viem";
 import { CONTRACT_ABI, CONTRACT_BYTECODE } from "./contract.js";
 
@@ -443,35 +451,135 @@ export interface EvmWallet {
   walletClient: WalletClient;
   address: Address;
   chainId: number;
+  /** Every EVM account QoreX exposed to this site (requested + read-only). */
+  accounts: Address[];
 }
 
 /**
- * Connect the QoreX EVM provider and return a viem wallet client.
- * REFUSES unless the connected EVM account is the main wallet and the
- * chain is qorechain-diana (9800). QoreX asks Toni to pick the account
- * to connect to this site — he must pick the main wallet.
+ * Read the accounts QoreX currently exposes to this site WITHOUT prompting
+ * (eth_accounts). Returns [] when nothing is exposed yet.
+ */
+export async function listEvmAccounts(
+  provider: QorexEip1193Provider,
+): Promise<Address[]> {
+  const res = await provider.request({ method: "eth_accounts" });
+  if (!Array.isArray(res)) return [];
+  return res.filter(
+    (a): a is Address => typeof a === "string" && a.startsWith("0x"),
+  );
+}
+
+/**
+ * Connect the QoreX EVM provider and return a viem wallet client BOUND TO
+ * THE MAIN WALLET — even when QoreX lists it second (or later).
+ *
+ * Why this exists: getEvmWalletClient() in @qorechain/evm takes
+ * accounts[0] only, and QoreX silently reconnects "Account 16"
+ * (0x4bbc…94dC5) as accounts[0] on every connect, with no picker — so
+ * this page enumerates every account QoreX exposes (eth_requestAccounts
+ * + eth_accounts) and builds its own wallet client with `account` set to
+ * the main wallet. deployContract sends from client.account, so the
+ * deploy then uses the main wallet even when QoreX lists it second.
+ *
+ * REFUSES unless the main wallet is among the exposed accounts and the
+ * chain is qorechain-diana (9800). Never deploys from the wrong account.
  */
 export async function connectEvmWallet(): Promise<EvmWallet> {
   const provider = await getQorexEvmProvider();
-  const { walletClient, address, chain } = await getEvmWalletClient({
-    provider,
-    chainId: EVM_CHAIN_ID,
-  });
-  if (chain.id !== EVM_CHAIN_ID) {
+  // eth_requestAccounts prompts the first time, then silently returns the
+  // authorized set. eth_accounts is read-only, no prompt.
+  const requested = await evmRequestAccounts(provider);
+  const exposed = await listEvmAccounts(provider);
+  const seen = new Set<string>();
+  const accounts: Address[] = [];
+  for (const a of [...requested, ...exposed]) {
+    const key = a.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      accounts.push(a);
+    }
+  }
+  const chainId = Number(await provider.request({ method: "eth_chainId" }));
+  if (chainId !== EVM_CHAIN_ID) {
     throw new Error(
-      `Wrong EVM chain: connected to ${chain.id}, need ${EVM_CHAIN_ID} ` +
+      `Wrong EVM chain: connected to ${chainId}, need ${EVM_CHAIN_ID} ` +
         `(qorechain-diana testnet). Switch networks in QoreX and try again.`,
     );
   }
-  if (address.toLowerCase() !== EXPECTED_EVM_ADDRESS.toLowerCase()) {
+  const main = accounts.find(
+    (a) => a.toLowerCase() === EXPECTED_EVM_ADDRESS.toLowerCase(),
+  );
+  if (!main) {
     throw new Error(
-      `Connected EVM account ${address} is NOT the main wallet ` +
-        `(${EXPECTED_EVM_ADDRESS}). In QoreX, switch to the main wallet, ` +
-        `disconnect this site in QoreX and reconnect it, then try again. ` +
-        `The deploy stays disabled until the main wallet is connected.`,
+      `QoreX exposed ${accounts.length} EVM account(s) to this site: ` +
+        `${accounts.length ? accounts.join(", ") : "(none)"}. The main wallet ` +
+        `(${EXPECTED_EVM_ADDRESS}) is NOT among them — the deploy stays ` +
+        `disabled. Use "Re-pick EVM account" below to force QoreX to show ` +
+        `its account picker, pick the main wallet there, then connect again. ` +
+        `If QoreX never shows a picker, disconnect this site in QoreX's ` +
+        `connected-sites settings first, then try again.`,
     );
   }
-  return { walletClient, address, chainId: chain.id };
+  const chain = defineChain({
+    id: EVM_CHAIN_ID,
+    name: "QoreChain EVM",
+    nativeCurrency: { name: "QOR", symbol: "QOR", decimals: 18 },
+    rpcUrls: { default: { http: [] } },
+  });
+  const walletClient = createWalletClient({
+    account: main,
+    chain,
+    transport: custom(provider),
+  });
+  return { walletClient, address: main, chainId, accounts };
+}
+
+export interface RepickEvmResult {
+  /** Outcome of wallet_revokePermissions (EIP-2255). */
+  revoke: { ok: boolean; result?: unknown; error?: string };
+  /** Outcome of the eth_requestAccounts that follows it. */
+  request: { ok: boolean; accounts?: Address[]; error?: string };
+}
+
+/**
+ * Force QoreX to forget this site's EVM permission and ask again.
+ *
+ * EIP-2255 wallet_revokePermissions({ eth_accounts: {} }) revokes the
+ * site's account permission; the eth_requestAccounts that follows must
+ * then show QoreX's account picker, so Toni can pick the main wallet.
+ * QoreX may not implement wallet_revokePermissions at all — if it
+ * refuses, the exact error is returned (not hidden), and the fallback is
+ * disconnecting the site in QoreX's connected-sites settings by hand.
+ * Never throws: both outcomes are reported so the page can show them.
+ */
+export async function repickEvmAccount(): Promise<RepickEvmResult> {
+  const provider = await getQorexEvmProvider();
+  const out: RepickEvmResult = {
+    revoke: { ok: false },
+    request: { ok: false },
+  };
+  try {
+    const res = await provider.request({
+      method: "wallet_revokePermissions",
+      params: [{ eth_accounts: {} }],
+    });
+    out.revoke = { ok: true, result: res ?? null };
+  } catch (e) {
+    out.revoke = {
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+  try {
+    const accounts = await evmRequestAccounts(provider);
+    out.request = { ok: true, accounts };
+  } catch (e) {
+    out.request = {
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+  return out;
 }
 
 let evmPublicClient: EvmClient | null = null;

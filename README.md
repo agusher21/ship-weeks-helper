@@ -29,8 +29,18 @@ blocks a transaction or displays a number it did not actually read.
 Remix is blocked: QoreX exposes only "Account 16" (`0x4bb...94dC5`, 0 QOR)
 to Remix and cannot switch to the main wallet there. This page deploys
 through the QoreX EVM provider (`window.qorex.evm`, EIP-6963) instead —
-QoreX asks which account to connect to this site, so the main wallet can
-be picked, and the page refuses to deploy from any other account.
+and it does **not** trust `accounts[0]`: QoreX silently reconnects
+Account 16 as the first account on every connect, with no picker, and
+disconnecting the site in QoreX's settings did not change it. So the
+page enumerates **every** account QoreX exposes (`eth_requestAccounts` +
+`eth_accounts`) and builds its own viem wallet client bound to the main
+wallet even when it is listed second — and still refuses to deploy from
+any other account. If only Account 16 is exposed, the **"Re-pick EVM
+account"** button calls EIP-2255 `wallet_revokePermissions`
+(`{ eth_accounts: {} }`) and then `eth_requestAccounts` to force QoreX's
+account picker; if QoreX does not support the revoke, its exact error is
+shown and the fallback is disconnecting the site in QoreX's
+connected-sites settings by hand.
 
 Two honest caveats, both surfaced in the page as errors:
 - `qorex-types` 0.1.0 documents `eth_sendTransaction` as "not yet
@@ -39,8 +49,8 @@ Two honest caveats, both surfaced in the page as errors:
   message and the Remix route (same contract file, Solidity 0.8.20) is
   the fallback once QoreX exposes the main wallet to Remix.
 - The EVM provider may expose a different account than the native lane.
-  The page refuses unless the connected EVM account is the main wallet
-  (`0x9ac294544131ac1709c3bbf8e680041475f04f61`).
+  The page enumerates all exposed accounts and refuses unless the main
+  wallet (`0x9ac294544131ac1709c3bbf8e680041475f04f61`) is among them.
 
 Badge 1 "First hybrid transaction" is already earned — not covered here.
 
@@ -50,8 +60,9 @@ Badges 1–2: every transaction is built in the page and signed **by Toni
 in QoreX** (`window.qorex.native` + `signAndBroadcast`; QoreX adds the
 hybrid secp256k1 + ML-DSA-87 layer). Badge 3: the deployment is signed by
 Toni in QoreX through the QoreX EVM provider (`window.qorex.evm`) via a
-viem wallet client (`@qorechain/evm` `getEvmWalletClient` +
-`deployContract`); the EVM-window fallback, if used, goes through the
+viem wallet client built directly on the provider (bound to the main
+wallet account, see the Badge 3 note) + `@qorechain/evm`
+`deployContract`; the EVM-window fallback, if used, goes through the
 native `signAndBroadcast` lane like badges 1–2. The page holds no wallet
 keys, seeds or mnemonics and never attempts a transaction on its own. The
 only key it keeps is the QoreSeal keypair it generates (badge 2, this
