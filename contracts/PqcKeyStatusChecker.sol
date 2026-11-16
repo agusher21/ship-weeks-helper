@@ -7,7 +7,7 @@ pragma solidity ^0.8.20;
 /// public view for later reads.
 contract PqcKeyStatusChecker {
     address internal constant PQC_KEY_STATUS =
-        0x0000000000000000000000000000000000000A02;
+        0x0000000000000000000000000000000000000a02;
 
     bool public lastRegistered;
     uint8 public lastAlgorithmId;
