@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   CHAIN_ID,
@@ -7,12 +7,16 @@ import {
   FEST_ME_URL,
   SWAP,
   checkKemKey,
+  clearKemKeypair,
   connectQorex,
   explorerTxUrl,
   fetchFusdMicro,
   generateKemKeypair,
   isQorexInstalled,
+  loadKemKeypair,
+  recoverKemKeypairFromSecret,
   registerKemKey,
+  saveKemKeypair,
   sendSwap,
   toHex,
   type BroadcastResult,
@@ -66,15 +70,25 @@ export function App() {
   const [connectStep, setConnectStep] = useState<Step>({ kind: "idle" });
 
   const [swapStep, setSwapStep] = useState<Step>({ kind: "idle" });
-  const [fusdBefore, setFusdBefore] = useState<string | null>(null);
 
   const [kem, setKem] = useState<KemKeypair | null>(null);
+  const [kemRestored, setKemRestored] = useState(false);
   const [kemSaved, setKemSaved] = useState(false);
   const [kemStep, setKemStep] = useState<Step>({ kind: "idle" });
   const [kemCheck, setKemCheck] = useState<Step>({ kind: "idle" });
 
   const connected = address !== null;
   const isMainWallet = address === EXPECTED_ADDRESS;
+
+  // Restore a keypair saved in this browser (same public key as the secret
+  // file already downloaded), so a retry re-registers the same key.
+  useEffect(() => {
+    const saved = loadKemKeypair();
+    if (saved) {
+      setKem(saved);
+      setKemRestored(true);
+    }
+  }, []);
 
   async function onConnect() {
     setConnectStep({ kind: "busy", note: "Asking QoreX to connect…" });
@@ -105,13 +119,9 @@ export function App() {
 
   async function onSwap() {
     if (!address) return;
-    setSwapStep({ kind: "busy", note: "Reading your fUSD balance first…" });
-    try {
-      const before = await fetchFusdMicro(address);
-      setFusdBefore(before);
-    } catch {
-      setFusdBefore(null); // REST has no CORS headers; the swap still works.
-    }
+    // No balance pre-read: the testnet REST API blocks browser reads (no
+    // CORS headers), and a read must never stand between you and the swap.
+    // The swap goes straight to QoreX approval.
     setSwapStep({
       kind: "busy",
       note: "Waiting for your approval in QoreX… (approve the swap, nothing else)",
@@ -143,36 +153,30 @@ export function App() {
   async function onVerifySwap() {
     if (!address) return;
     setSwapStep({ kind: "busy", note: "Reading your fUSD balance…" });
-    try {
-      const after = await fetchFusdMicro(address);
-      const beforeNum = fusdBefore === null ? null : BigInt(fusdBefore);
-      const afterNum = BigInt(after);
-      const gained =
-        beforeNum === null
-          ? null
-          : (afterNum - beforeNum).toString();
-      setSwapStep({
-        kind: "ok",
-        text:
-          `fUSD balance now: ${(Number(after) / 1_000_000).toFixed(6)} fUSD` +
-          (gained !== null
-            ? ` (gained ~${(Number(gained) / 1_000_000).toFixed(6)} fUSD since before the swap).`
-            : `.`),
-      });
-    } catch {
+    const after = await fetchFusdMicro(address);
+    if (after === null) {
       setSwapStep({
         kind: "err",
         text:
-          "The testnet REST API sends no CORS headers, so this page cannot read balances directly. " +
+          "Balance unavailable — the testnet REST API sends no CORS headers, so this page cannot read balances directly. " +
           "Check the tx on the explorer link above instead — your fUSD balance there should be ~0.081 higher.",
       });
+      return;
     }
+    setSwapStep({
+      kind: "ok",
+      text: `fUSD balance now: ${(Number(after) / 1_000_000).toFixed(6)} fUSD.`,
+    });
   }
 
   function onGenerateKem() {
     try {
       const kp = generateKemKeypair();
+      // Persist immediately: a reload/retry must re-register this SAME key,
+      // the one the secret file you download belongs to.
+      saveKemKeypair(kp);
       setKem(kp);
+      setKemRestored(false);
       setKemSaved(false);
       setKemStep({ kind: "idle" });
       setKemCheck({ kind: "idle" });
@@ -182,6 +186,39 @@ export function App() {
         text: e instanceof Error ? e.message : String(e),
       });
     }
+  }
+
+  async function onRestoreKemFile(file: File) {
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const kp = recoverKemKeypairFromSecret(buf);
+      saveKemKeypair(kp);
+      setKem(kp);
+      setKemRestored(true);
+      setKemSaved(false);
+      setKemStep({
+        kind: "ok",
+        text:
+          `Restored the keypair from your downloaded secret file — same public key ` +
+          `(fingerprint ${toHex(kp.publicKey.slice(0, 16))}…). ` +
+          `Registering it now will publish the key your saved secret file unlocks.`,
+      });
+      setKemCheck({ kind: "idle" });
+    } catch (e) {
+      setKemStep({
+        kind: "err",
+        text: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  function onForgetKem() {
+    clearKemKeypair();
+    setKem(null);
+    setKemRestored(false);
+    setKemSaved(false);
+    setKemStep({ kind: "idle" });
+    setKemCheck({ kind: "idle" });
   }
 
   function onDownloadSecret() {
@@ -232,27 +269,27 @@ export function App() {
   async function onCheckKem() {
     if (!address) return;
     setKemCheck({ kind: "busy", note: "Reading the on-chain KEM registry…" });
-    try {
-      const res = await checkKemKey(address);
-      setKemCheck(
-        res.found
-          ? {
-              kind: "ok",
-              text: `KEM key FOUND on chain (algorithm ${res.algorithm ?? "?"}). Badge 2 is ready to Check.`,
-            }
-          : {
-              kind: "err",
-              text: "No KEM key found for this address yet — register it first.",
-            },
-      );
-    } catch {
+    const res = await checkKemKey(address);
+    if (res.unavailable) {
       setKemCheck({
         kind: "err",
         text:
-          "The testnet REST API sends no CORS headers, so this page cannot read the registry directly. " +
+          "Registry read unavailable — the testnet REST API sends no CORS headers, so this page cannot read the registry directly. " +
           "Use the Check button on My Space instead — it reads the chain server-side.",
       });
+      return;
     }
+    setKemCheck(
+      res.found
+        ? {
+            kind: "ok",
+            text: `KEM key FOUND on chain (algorithm ${res.algorithm ?? "?"}). Badge 2 is ready to Check.`,
+          }
+        : {
+            kind: "err",
+            text: "No KEM key found for this address yet — register it first.",
+          },
+    );
   }
 
   return (
@@ -267,7 +304,8 @@ export function App() {
       <p className="muted small">
         Nothing here ever asks for a seed, mnemonic or private key. Every
         transaction is built in this page and signed by <b>you</b> in QoreX.
-        The page holds no keys and uploads nothing anywhere.
+        The page uploads nothing anywhere — the only key it keeps is the
+        QoreSeal keypair it generates, saved in this browser only (badge 2).
       </p>
 
       <div className="card">
@@ -354,14 +392,37 @@ export function App() {
           ⚠️ <b>Save the secret key before you register.</b> The secret key
           (3,168 bytes) is the <b>only</b> way to decrypt messages sent to
           this key. If you lose it, the published key is useless (you can
-          re-register a fresh one, but old messages stay locked). This page
-          never stores, uploads or shows the full secret key — download the
-          file and keep it somewhere safe.
+          re-register a fresh one, but old messages stay locked). The keypair
+          is also saved in <b>this browser only</b> (localStorage, never
+          uploaded) so a reload or retry keeps the <b>same</b> public key —
+          use "Forget saved keypair" below to wipe it from this browser.
         </div>
 
         <button onClick={onGenerateKem}>1. Generate keypair in browser</button>
+        <p className="muted small">
+          Already generated a keypair and downloaded its secret file before?
+          Pick that file to restore the <b>same</b> public key instead of
+          generating a fresh one:{" "}
+          <input
+            type="file"
+            accept=".bin"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void onRestoreKemFile(f);
+              e.target.value = "";
+            }}
+          />
+        </p>
         {kem ? (
           <>
+            {kemRestored ? (
+              <p className="muted">
+                ♻️ Restored a keypair saved in this browser — fingerprint{" "}
+                <span className="mono">{toHex(kem.publicKey.slice(0, 16))}…</span>.
+                This is the same public key as the secret file you already
+                downloaded; registering it publishes the key that file unlocks.
+              </p>
+            ) : null}
             <dl className="kv">
               <dt>Public key</dt>
               <dd>
@@ -373,6 +434,9 @@ export function App() {
             </dl>
             <button className="secondary" onClick={onDownloadSecret}>
               ⬇ Download secret key (.bin)
+            </button>
+            <button className="secondary" onClick={onForgetKem}>
+              Forget saved keypair (wipe from this browser)
             </button>
             <p>
               <label>
