@@ -8,20 +8,29 @@ import {
   SWAP,
   checkKemKey,
   clearKemKeypair,
+  connectEvmWallet,
   connectQorex,
+  deployPqcChecker,
+  evmExplorerAddressUrl,
+  evmExplorerTxUrl,
   explorerTxUrl,
   fetchFusdMicro,
   generateKemKeypair,
   isQorexInstalled,
   loadKemKeypair,
+  openEvmWindow,
   recoverKemKeypairFromSecret,
   registerKemKey,
   saveKemKeypair,
   sendSwap,
   toHex,
+  verifyPqcChecker,
   type BroadcastResult,
+  type DeployResult,
   type KemKeypair,
+  type PqcCheckResult,
 } from "./qore.js";
+import type { WalletClient } from "viem";
 
 type Step =
   | { kind: "idle" }
@@ -77,8 +86,19 @@ export function App() {
   const [kemStep, setKemStep] = useState<Step>({ kind: "idle" });
   const [kemCheck, setKemCheck] = useState<Step>({ kind: "idle" });
 
+  const [evmWallet, setEvmWallet] = useState<WalletClient | null>(null);
+  const [evmAddress, setEvmAddress] = useState<string | null>(null);
+  const [evmStep, setEvmStep] = useState<Step>({ kind: "idle" });
+  const [deployStep, setDeployStep] = useState<Step>({ kind: "idle" });
+  const [deployed, setDeployed] = useState<DeployResult | null>(null);
+  const [verifyStep, setVerifyStep] = useState<Step>({ kind: "idle" });
+  const [windowStep, setWindowStep] = useState<Step>({ kind: "idle" });
+
   const connected = address !== null;
   const isMainWallet = address === EXPECTED_ADDRESS;
+  const evmConnected = evmAddress !== null;
+  const evmIsMainWallet =
+    evmAddress?.toLowerCase() === EXPECTED_EVM_ADDRESS.toLowerCase();
 
   // Restore a keypair saved in this browser (same public key as the secret
   // file already downloaded), so a retry re-registers the same key.
@@ -292,14 +312,136 @@ export function App() {
     );
   }
 
+  // --- Badge 3: deploy PqcKeyStatusChecker from this page -----------------
+  //
+  // The Remix route is blocked: QoreX exposes only "Account 16" to Remix.
+  // This page deploys through the QoreX EVM provider instead (EIP-6963) —
+  // the same wallet the swap already proved reaches the main account.
+
+  async function onConnectEvm() {
+    setEvmStep({ kind: "busy", note: "Asking QoreX to connect this site…" });
+    try {
+      const { walletClient, address: evmAddr } = await connectEvmWallet();
+      setEvmWallet(walletClient);
+      setEvmAddress(evmAddr);
+      setEvmStep({
+        kind: "ok",
+        text: `EVM wallet connected — this is the MAIN wallet (${evmAddr}). The deploy button is now enabled.`,
+      });
+    } catch (e) {
+      setEvmWallet(null);
+      setEvmAddress(null);
+      setEvmStep({
+        kind: "err",
+        text: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  async function onDeploy() {
+    if (!evmWallet) return;
+    setDeployStep({
+      kind: "busy",
+      note: "Waiting for your approval in QoreX… (approve the contract deployment, nothing else)",
+    });
+    try {
+      const res = await deployPqcChecker(evmWallet);
+      setDeployed(res);
+      setDeployStep({
+        kind: "ok",
+        text:
+          `Contract deployed to ${res.contractAddress}. Copy the deployment ` +
+          `tx hash below, paste it into the "First contract with a PQC check" ` +
+          `field on My Space, then click Check there.`,
+        txHash: res.txHash,
+      });
+    } catch (e) {
+      setDeployStep({
+        kind: "err",
+        text: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  async function onVerifyContract() {
+    if (!deployed) return;
+    setVerifyStep({
+      kind: "busy",
+      note: "Reading lastRegistered / lastAlgorithmId from the contract…",
+    });
+    try {
+      const res: PqcCheckResult = await verifyPqcChecker(
+        deployed.contractAddress,
+      );
+      const ok =
+        res.lastRegistered &&
+        res.lastAlgorithmId === 1 &&
+        res.statusOfRegistered &&
+        res.statusOfAlgorithmId === 1;
+      setVerifyStep(
+        ok
+          ? {
+              kind: "ok",
+              text:
+                `Verified on chain: lastRegistered = true, lastAlgorithmId = 1 ` +
+                `(ML-DSA-87), statusOf(main wallet) = registered, algorithm 1. ` +
+                `The deployment tx hash above is ready to paste into My Space.`,
+            }
+          : {
+              kind: "err",
+              text:
+                `Unexpected values: lastRegistered = ${res.lastRegistered}, ` +
+                `lastAlgorithmId = ${res.lastAlgorithmId}, ` +
+                `statusOf(main wallet) = registered ${res.statusOfRegistered}, ` +
+                `algorithm ${res.statusOfAlgorithmId}. Expected true / 1 / true / 1.`,
+            },
+      );
+    } catch (e) {
+      setVerifyStep({
+        kind: "err",
+        text: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  async function onOpenWindow() {
+    if (!address) return;
+    setWindowStep({
+      kind: "busy",
+      note: "Waiting for your approval in QoreX… (approve opening the EVM window, nothing else)",
+    });
+    try {
+      const res = await openEvmWindow(address);
+      if (res.code !== 0) {
+        setWindowStep({
+          kind: "err",
+          text: `QoreX returned code ${res.code} — the window did not open. Tx: ${res.txHash}`,
+        });
+        return;
+      }
+      setWindowStep({
+        kind: "ok",
+        text:
+          `${formatResult(res)} EVM window open (600 blocks, up to 5 EVM txs). ` +
+          `Now retry the deploy above.`,
+        txHash: res.txHash,
+      });
+    } catch (e) {
+      setWindowStep({
+        kind: "err",
+        text: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   return (
     <div className="wrap">
       <h1>🛡️ Ship Weeks Helper</h1>
       <p className="muted">
-        QoreChain Developer Fest — testnet <b>{CHAIN_ID}</b>. Badges 1 &amp; 2,
-        done from your own QoreX wallet. <b>Badge 1 "First hybrid
-        transaction" is already earned</b> — this page covers the remaining
-        two on-chain steps plus the badge-3 contract.
+        QoreChain Developer Fest — testnet <b>{CHAIN_ID}</b>. All three
+        remaining Ship Weeks badges, done from your own QoreX wallet.{" "}
+        <b>Badge 1 "First hybrid transaction" is already earned</b> — this
+        page covers the swap, the QoreSeal key, and the PQC contract deploy.
       </p>
       <p className="muted small">
         Nothing here ever asks for a seed, mnemonic or private key. Every
@@ -475,58 +617,117 @@ export function App() {
       </div>
 
       <div className="card">
-        <h2>Badge 3 — First contract with a PQC check</h2>
+        <h2>Badge 3 — Deploy PQC contract</h2>
         <p>
-          Deploy a small Solidity contract that calls the PQC key-status
-          precompile (<span className="mono">0x0A02</span>), then paste the
-          deployment tx hash into the Ship Weeks field on My Space.
+          Deploy <b>PqcKeyStatusChecker</b> (compiled here with solc 0.8.20
+          from{" "}
+          <a
+            href="https://github.com/agusher21/ship-weeks-helper/blob/main/contracts/PqcKeyStatusChecker.sol"
+            target="_blank"
+            rel="noreferrer"
+          >
+            contracts/PqcKeyStatusChecker.sol
+          </a>
+          ) straight from this page, through QoreX. Its constructor calls
+          the PQC key-status precompile (<span className="mono">0x0A02</span>)
+          with your address, so the deployment tx itself exercises the
+          precompile. Cost ~0.02–0.05 QOR gas.
         </p>
-        <ol>
-          <li>
-            Open{" "}
-            <a
-              href="https://remix.ethereum.org"
-              target="_blank"
-              rel="noreferrer"
-            >
-              Remix
-            </a>{" "}
-            → create{" "}
-            <span className="mono">PqcKeyStatusChecker.sol</span> — copy the
-            contract from{" "}
-            <a
-              href="https://github.com/agusher21/ship-weeks-helper/blob/main/contracts/PqcKeyStatusChecker.sol"
-              target="_blank"
-              rel="noreferrer"
-            >
-              contracts/PqcKeyStatusChecker.sol
-            </a>{" "}
-            in this repo → compile with Solidity 0.8.20.
-          </li>
-          <li>
-            In QoreX, select the <b>qorechain-diana testnet</b> network (EVM
-            chain 9800), main wallet{" "}
-            <span className="mono">{EXPECTED_EVM_ADDRESS}</span> active.
-          </li>
-          <li>
-            Remix → Deploy &amp; Run → Environment:{" "}
-            <b>Injected Provider</b> (QoreX) → constructor argument:{" "}
-            <span className="mono">{EXPECTED_EVM_ADDRESS}</span> → Deploy →
-            approve in QoreX.
-          </li>
-          <li>
-            Copy the <b>deployment transaction hash</b> → paste it into the
-            "First contract with a PQC check" field on My Space →{" "}
-            <b>Check</b>.
-          </li>
-        </ol>
         <p className="muted small">
-          The constructor calls the precompile with your address, so{" "}
-          <span className="mono">lastRegistered</span> reads{" "}
-          <span className="mono">true</span> on chain. Cost ~0.02–0.05 QOR
-          gas. If Remix says the EVM window is not open, QoreX normally opens
-          it automatically as part of its EVM flow — retry the deploy once
-          before anything else.
+          Why here and not Remix: QoreX exposes only "Account 16" (0 QOR) to
+          Remix and cannot switch to the main wallet there. This page talks
+          to the QoreX EVM provider directly — QoreX asks you which account
+          to connect to this site, so pick the <b>main wallet</b>. The deploy
+          stays disabled until the main wallet (
+          <span className="mono">{EXPECTED_EVM_ADDRESS}</span>) is connected.
+        </p>
+
+        <button
+          onClick={onConnectEvm}
+          disabled={evmConnected && evmIsMainWallet}
+        >
+          1. Connect EVM wallet (QoreX)
+        </button>
+        {evmAddress ? (
+          <p className="mono">
+            {evmAddress}
+            {evmIsMainWallet
+              ? " — ✅ main wallet"
+              : " — ⚠️ NOT the main wallet"}
+          </p>
+        ) : null}
+        <Status step={evmStep} />
+
+        <button
+          onClick={onDeploy}
+          disabled={!evmConnected || !evmIsMainWallet}
+        >
+          2. Deploy PqcKeyStatusChecker
+        </button>
+        <Status step={deployStep} />
+        {deployed ? (
+          <dl className="kv">
+            <dt>Contract</dt>
+            <dd>
+              <a
+                href={evmExplorerAddressUrl(deployed.contractAddress)}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {deployed.contractAddress}
+              </a>
+            </dd>
+            <dt>Deploy tx</dt>
+            <dd>
+              <a
+                href={evmExplorerTxUrl(deployed.txHash)}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {deployed.txHash}
+              </a>
+            </dd>
+          </dl>
+        ) : null}
+        <button
+          className="secondary"
+          onClick={onVerifyContract}
+          disabled={!deployed}
+        >
+          Verify on chain (lastRegistered / lastAlgorithmId)
+        </button>
+        <Status step={verifyStep} />
+
+        <p className="muted small">
+          After the deploy + verify: open{" "}
+          <a href={FEST_ME_URL} target="_blank" rel="noreferrer">
+            My Space
+          </a>
+          , paste the <b>deployment tx hash</b> above into the "First
+          contract with a PQC check" field, then click <b>Check</b>.
+        </p>
+
+        <p className="muted small">
+          Only if the deploy fails with an EVM-window error: open the window
+          first (one native tx, approved in QoreX — needs the main wallet
+          connected at the top of this page), then retry the deploy.
+        </p>
+        <button
+          className="secondary"
+          onClick={onOpenWindow}
+          disabled={!connected || !isMainWallet}
+        >
+          Open EVM window (only if deploy fails)
+        </button>
+        <Status step={windowStep} />
+
+        <p className="muted small">
+          If QoreX says the EVM method is not supported, your QoreX build
+          cannot send EVM transactions from a website yet — the fallback is
+          the Remix route (same contract file, Solidity 0.8.20, constructor
+          argument{" "}
+          <span className="mono">{EXPECTED_EVM_ADDRESS}</span>), once QoreX
+          exposes the main wallet to Remix.
         </p>
       </div>
 

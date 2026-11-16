@@ -19,6 +19,7 @@
 import {
   fetchKemKey,
   msg,
+  openEvmWindowMsg,
   qorechainRegistry,
   validateKemPublicKey,
 } from "@qorechain/sdk";
@@ -363,4 +364,243 @@ export function toHex(bytes: Uint8Array): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+// ---------------------------------------------------------------------------
+// Badge 3 — first contract with a PQC check (EVM deploy, PqcKeyStatusChecker)
+// ---------------------------------------------------------------------------
+//
+// The Remix route is BLOCKED: QoreX exposes only "Account 16"
+// (0x4bb...94dC5, 0 QOR) to Remix, and Remix cannot switch to the main
+// wallet. The helper page deploys instead, through the QoreX EVM provider
+// (`window.qorex.evm`, EIP-6963) + @qorechain/evm's viem wrappers — the
+// same wallet the swap already proved reaches the main account.
+//
+// Two honest caveats, both surfaced to the user as errors, never hidden:
+//  - The QoreX EVM provider answers eth_accounts / eth_requestAccounts, but
+//    qorex-types 0.1.0 documents eth_sendTransaction as "not yet supported"
+//    in QoreX 0.3.x ("planned for a future QoreX release"). If Toni's build
+//    still refuses it, the deploy fails here with QoreX's exact message and
+//    the Remix route (or a newer QoreX) is the fallback.
+//  - The EVM provider may expose a different account than the native lane
+//    (Remix saw only "Account 16"). connectEvmWallet() REFUSES unless the
+//    connected EVM account is the main wallet 0x9ac2… — never deploy from
+//    the wrong account.
+
+import {
+  createEvmClient,
+  deployContract as evmDeployContract,
+  getEvmWalletClient,
+  readContract as evmReadContract,
+  type EvmClient,
+} from "@qorechain/evm";
+import {
+  discoverQorexEip1193,
+  findQorexEip1193,
+  type QorexEip1193Provider,
+} from "@qorechain/qorex-types";
+import type { Address, Hash, WalletClient } from "viem";
+import { CONTRACT_ABI, CONTRACT_BYTECODE } from "./contract.js";
+
+/** EVM JSON-RPC endpoint for qorechain-diana testnet. */
+export const EVM_RPC_URL = "https://evm-testnet.qore.host";
+/** EVM chain id for qorechain-diana testnet (0x2648). */
+export const EVM_CHAIN_ID = 9800;
+/** Block explorer for EVM transaction hashes. */
+export const EVM_EXPLORER_HOME = "https://explore.qore.network";
+
+export function evmExplorerTxUrl(txHash: string): string {
+  return `${EVM_EXPLORER_HOME}/tx/${txHash}`;
+}
+
+export function evmExplorerAddressUrl(address: string): string {
+  return `${EVM_EXPLORER_HOME}/address/${address}`;
+}
+
+/** Find the QoreX EVM provider (window.qorex.evm, via EIP-6963). */
+export async function getQorexEvmProvider(): Promise<QorexEip1193Provider> {
+  const sync = findQorexEip1193();
+  if (sync) return sync;
+  const found = await discoverQorexEip1193({ timeoutMs: 2000 });
+  if (found) return found;
+  const injected = (
+    window as unknown as { qorex?: { evm?: unknown } }
+  ).qorex?.evm;
+  if (
+    injected &&
+    typeof injected === "object" &&
+    typeof (injected as { request?: unknown }).request === "function"
+  ) {
+    return injected as QorexEip1193Provider;
+  }
+  throw new Error(
+    "QoreX EVM provider not found in this browser. Open this page in the " +
+      "browser with the QoreX extension (Testnet), then try again.",
+  );
+}
+
+export interface EvmWallet {
+  walletClient: WalletClient;
+  address: Address;
+  chainId: number;
+}
+
+/**
+ * Connect the QoreX EVM provider and return a viem wallet client.
+ * REFUSES unless the connected EVM account is the main wallet and the
+ * chain is qorechain-diana (9800). QoreX asks Toni to pick the account
+ * to connect to this site — he must pick the main wallet.
+ */
+export async function connectEvmWallet(): Promise<EvmWallet> {
+  const provider = await getQorexEvmProvider();
+  const { walletClient, address, chain } = await getEvmWalletClient({
+    provider,
+    chainId: EVM_CHAIN_ID,
+  });
+  if (chain.id !== EVM_CHAIN_ID) {
+    throw new Error(
+      `Wrong EVM chain: connected to ${chain.id}, need ${EVM_CHAIN_ID} ` +
+        `(qorechain-diana testnet). Switch networks in QoreX and try again.`,
+    );
+  }
+  if (address.toLowerCase() !== EXPECTED_EVM_ADDRESS.toLowerCase()) {
+    throw new Error(
+      `Connected EVM account ${address} is NOT the main wallet ` +
+        `(${EXPECTED_EVM_ADDRESS}). In QoreX, switch to the main wallet, ` +
+        `disconnect this site in QoreX and reconnect it, then try again. ` +
+        `The deploy stays disabled until the main wallet is connected.`,
+    );
+  }
+  return { walletClient, address, chainId: chain.id };
+}
+
+let evmPublicClient: EvmClient | null = null;
+
+/** Read-only EVM client for receipts + contract reads (no wallet needed). */
+export async function getEvmPublicClient(): Promise<EvmClient> {
+  if (!evmPublicClient) {
+    evmPublicClient = await createEvmClient({
+      rpcUrl: EVM_RPC_URL,
+      chainId: EVM_CHAIN_ID,
+    });
+  }
+  return evmPublicClient;
+}
+
+export interface DeployResult {
+  txHash: Hash;
+  contractAddress: Address;
+}
+
+/**
+ * Deploy PqcKeyStatusChecker with constructor argument = the main wallet
+ * address. QoreX prompts Toni to approve the deployment. Returns the
+ * deployment tx hash + the deployed contract address (from the receipt).
+ */
+export async function deployPqcChecker(
+  walletClient: WalletClient,
+): Promise<DeployResult> {
+  const txHash = await evmDeployContract(walletClient, {
+    abi: CONTRACT_ABI,
+    bytecode: CONTRACT_BYTECODE,
+    args: [EXPECTED_EVM_ADDRESS],
+  });
+  const publicClient = await getEvmPublicClient();
+  const receipt = await publicClient.publicClient.waitForTransactionReceipt({
+    hash: txHash,
+    timeout: 60_000,
+  });
+  if (receipt.status !== "success") {
+    throw new Error(
+      `Deployment tx ${txHash} was mined but FAILED (status ${receipt.status}). ` +
+        `No contract was deployed.`,
+    );
+  }
+  if (!receipt.contractAddress) {
+    throw new Error(
+      `Deployment tx ${txHash} confirmed but the receipt carries no ` +
+        `contract address.`,
+    );
+  }
+  return { txHash, contractAddress: receipt.contractAddress };
+}
+
+export interface PqcCheckResult {
+  contractAddress: Address;
+  lastRegistered: boolean;
+  lastAlgorithmId: number;
+  statusOfRegistered: boolean;
+  statusOfAlgorithmId: number;
+}
+
+/**
+ * Read-only verification of a deployed PqcKeyStatusChecker: the values the
+ * constructor stored (lastRegistered / lastAlgorithmId) and a fresh
+ * statusOf(main wallet) read. Expects lastRegistered = true and
+ * lastAlgorithmId = 1 (ML-DSA-87 / Dilithium-5).
+ */
+export async function verifyPqcChecker(
+  contractAddress: Address,
+): Promise<PqcCheckResult> {
+  const client = await getEvmPublicClient();
+  const [lastRegistered, lastAlgorithmId, statusOf] = await Promise.all([
+    evmReadContract(client.publicClient, {
+      address: contractAddress,
+      abi: CONTRACT_ABI,
+      functionName: "lastRegistered",
+    }),
+    evmReadContract(client.publicClient, {
+      address: contractAddress,
+      abi: CONTRACT_ABI,
+      functionName: "lastAlgorithmId",
+    }),
+    evmReadContract(client.publicClient, {
+      address: contractAddress,
+      abi: CONTRACT_ABI,
+      functionName: "statusOf",
+      args: [EXPECTED_EVM_ADDRESS],
+    }),
+  ]);
+  if (typeof lastRegistered !== "boolean") {
+    throw new Error(
+      `Unexpected lastRegistered read from ${contractAddress}: ${String(lastRegistered)}`,
+    );
+  }
+  if (typeof lastAlgorithmId !== "number") {
+    throw new Error(
+      `Unexpected lastAlgorithmId read from ${contractAddress}: ${String(lastAlgorithmId)}`,
+    );
+  }
+  if (!Array.isArray(statusOf) || statusOf.length < 2) {
+    throw new Error(
+      `Unexpected statusOf read from ${contractAddress}: ${String(statusOf)}`,
+    );
+  }
+  return {
+    contractAddress,
+    lastRegistered,
+    lastAlgorithmId,
+    statusOfRegistered: statusOf[0] as boolean,
+    statusOfAlgorithmId: statusOf[1] as number,
+  };
+}
+
+/**
+ * Open an EVM authorisation window via the NATIVE lane (one hybrid-signed
+ * tx, approved in QoreX). Only needed if a deploy fails with a window
+ * error — QoreX normally opens the window automatically as part of its
+ * EVM flow. Window: 600 blocks, up to 5 EVM txs, max 1 QOR total spend
+ * (deploy is value 0; its max fee is ~0.05 QOR). Note: broadcasting this
+ * advances the account's EVM nonce.
+ */
+export async function openEvmWindow(
+  sender: string,
+): Promise<BroadcastResult> {
+  const message = openEvmWindowMsg({
+    sender,
+    blocks: 600,
+    maxTxs: 5,
+    maxValue: "1000000", // 1 QOR in uqor
+  });
+  return broadcastOne([message], "Ship Weeks: open EVM window for badge 3");
 }
